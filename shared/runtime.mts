@@ -3,7 +3,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 
-export const VERSION = 'b1-Rc4'
+export const VERSION = 'b1-Rc5'
 export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 export const dataRoot = path.resolve(process.env.ME_DATA_DIR ?? path.join(root, 'data'))
 
