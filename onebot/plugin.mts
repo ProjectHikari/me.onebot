@@ -1,0 +1,15 @@
+import path from 'node:path'
+import { run } from '../../core/bridge/sdk/typescript/sdk.mts'
+import { dataRoot, jsonFile, log } from '../shared/runtime.mts'
+import { OneBot, validateConfig } from './adapter.mts'
+
+await run(async ctx => {
+  const config = validateConfig(await jsonFile(process.env.ME_ONEBOT_CONFIG ?? path.join(dataRoot, 'onebot.json'), {}))
+  const adapter = new OneBot(config, (message, signal) => ctx.parallel('body.onebot.message', message as any, signal), ctx.signal)
+  await ctx.defer('OneBot连接与消息调用', () => adapter.close())
+  await adapter.open()
+  log('INFO', ctx.pluginId, `OneBot连接方式: ${config.mode === 'forward' ? '正向' : '反向'}WebSocket`)
+  await ctx.provide('adapter.onebot', (method, input, signal) => adapter.service(method, input, signal))
+  await ctx.every('OneBot连接心跳', 20000, async () => adapter.pulse())
+  await ctx.after('启用OneBot入口', 0, async () => adapter.activate())
+})

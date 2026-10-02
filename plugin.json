@@ -1,0 +1,14 @@
+{
+  "id": "me.onebot",
+  "command": [
+    "${NODE}",
+    "plugin.mts"
+  ],
+  "provides": [
+    "adapter.onebot"
+  ],
+  "events": {
+    "body.onebot.message": "parallel"
+  },
+  "dir": "onebot"
+}
