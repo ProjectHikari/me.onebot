@@ -118,3 +118,24 @@ test('startup restarts a registered SnowLuma process after an authorization reje
   assert.equal(startup.status().managed, true)
   assert.equal(startup.status().state, 'running')
 })
+
+test('startup does not block initialization while QQ is unavailable and releases readiness checks', { timeout: 5000 }, async t => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises'), { tmpdir } = await import('node:os'), path = await import('node:path')
+  const { OneBotManager } = await import('../onebot/manager.mts')
+  const directory = await mkdtemp(path.join(tmpdir(), 'onebot-readiness-')), file = path.join(directory, 'onebot.json'), server = createServer()
+  server.on('upgrade', (_request, socket) => socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'))
+  const endpoint = (await listen(server)).replace('http:', 'ws:')
+  await writeFile(path.join(directory, 'index.mjs'), 'setInterval(() => {}, 1000)')
+  await writeFile(file, JSON.stringify({ mode: 'forward', url: endpoint, startup: { enabled: true, directory, timeout: 60000 } }))
+  const manager = new OneBotManager(file, async () => {})
+  t.after(async () => { await manager.close(); await closeServer(server); await rm(directory, { recursive: true, force: true }) })
+  let deadline: NodeJS.Timeout | undefined
+  try {
+    await Promise.race([manager.open(), new Promise<never>((_, reject) => { deadline = setTimeout(() => reject(new Error('等待QQ阻塞了初始化')), 2000) })])
+  } finally { clearTimeout(deadline) }
+  const pid = manager.startup!.status().pid
+  assert.ok(pid); assert.equal(manager.startup!.work.active.size, 1)
+  await manager.close()
+  assert.equal(manager.startup!.work.active.size, 0)
+  assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' })
+})

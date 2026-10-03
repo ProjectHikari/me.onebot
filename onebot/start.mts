@@ -4,7 +4,7 @@ import { constants } from 'node:fs'
 import path from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { WebSocket } from 'ws'
-import { integer, log, object, text } from '../shared/runtime.mts'
+import { integer, log, object, text, Work } from '../shared/runtime.mts'
 
 export type StartupConfig = { enabled: boolean; directory: string; timeout: number; autoHook: boolean }
 export function startupConfig(raw: any = {}): StartupConfig {
@@ -63,6 +63,7 @@ async function stopRecordedProcess(pid: number, signal: AbortSignal): Promise<bo
   return !processAlive(pid)
 }
 export class SnowLumaStartup {
+  work = new Work()
   config: StartupConfig
   child?: ChildProcess
   exited?: Promise<void>
@@ -93,7 +94,7 @@ export class SnowLumaStartup {
     try { await access(command, constants.X_OK) } catch { command = process.execPath }
     this.state = 'starting'; log('INFO', 'me.onebot', '正在启动SnowLuma')
     const child = this.child = spawn(command, ['index.mjs'], { cwd: directory, env: { ...process.env, SNOWLUMA_HOOK_AUTOLOAD: this.config.autoHook ? '1' : '0' }, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] })
-    this.exited = new Promise(resolve => child.once('close', () => { if (!this.stopping) { this.state = 'failed'; this.error = 'SnowLuma进程已退出'; log('ERROR', 'me.onebot', this.error) }; resolve() }))
+    this.exited = new Promise(resolve => child.once('close', () => { this.work.controller.abort(); if (!this.stopping) { this.state = 'failed'; this.error = 'SnowLuma进程已退出'; log('ERROR', 'me.onebot', this.error) }; resolve() }))
     child.on('error', () => { this.error = 'SnowLuma启动失败' })
     for (const stream of [child.stdout!, child.stderr!]) {
       let partial = ''
@@ -114,6 +115,12 @@ export class SnowLumaStartup {
     await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject) })
     this.state = 'running'; log('OK', 'me.onebot', 'SnowLuma进程已启动')
     if (connection.mode !== 'forward') return
+    // QQ登录和Hook就绪不占用插件初始化期限，停止时等待探测实际退出
+    this.work.run(lifetime => this.waitReady(connection, AbortSignal.any([signal, lifetime]))).catch(error => {
+      if (!signal.aborted && !this.work.signal.aborted) { this.error = String(error instanceof Error ? error.message : error); log('ERROR', 'me.onebot', `SnowLuma接口探测失败: ${this.error}`) }
+    })
+  }
+  async waitReady(connection: { url: string; token: string }, signal: AbortSignal): Promise<void> {
     const end = Date.now() + this.config.timeout
     let lastProbe: ProbeResult = 'unavailable'
     while (Date.now() < end) {
@@ -127,9 +134,10 @@ export class SnowLumaStartup {
   }
   status(): any { return { state: this.state, managed: !!this.child, pid: this.child?.pid, error: this.error } }
   async close(): Promise<void> {
+    this.stopping = true
+    await this.work.close()
     const child = this.child
     if (!child?.pid) return
-    this.stopping = true
     const kill = (signal: NodeJS.Signals) => {
       try { if (process.platform === 'win32') child.kill(signal); else process.kill(-child.pid!, signal) } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error }
     }
