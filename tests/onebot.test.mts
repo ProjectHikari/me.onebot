@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createServer } from 'node:http'
+import { spawn } from 'node:child_process'
 import { WebSocket, WebSocketServer } from 'ws'
 import { OneBot, bodyMessage, validateConfig } from '../onebot/adapter.mts'
 import { listen, until, closeServer } from './fixtures.mts'
@@ -97,4 +98,23 @@ test('startup reuses a live OneBot without owning it and terminates only its own
   await owned.open({ mode: 'reverse', url: endpoint, token: '' }, new AbortController().signal)
   const pid = owned.status().pid; assert.ok(pid); await owned.close()
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }); assert.equal(owned.status().state, 'stopped')
+})
+
+test('startup restarts a registered SnowLuma process after an authorization rejection', async t => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises'), { tmpdir } = await import('node:os'), path = await import('node:path')
+  const { SnowLumaStartup, startupConfig } = await import('../onebot/start.mts')
+  const directory = await mkdtemp(path.join(tmpdir(), 'onebot-restart-')), server = createServer()
+  server.on('upgrade', (_request, socket) => socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'))
+  const endpoint = (await listen(server)).replace('http:', 'ws:')
+  await writeFile(path.join(directory, 'index.mjs'), 'setInterval(() => {}, 1000)')
+  const previous = spawn(process.execPath, ['index.mjs'], { cwd: directory, stdio: 'ignore' })
+  const previousExit = new Promise<void>((resolve, reject) => { previous.once('exit', () => resolve()); previous.once('error', reject) })
+  await new Promise<void>((resolve, reject) => { previous.once('spawn', resolve); previous.once('error', reject) })
+  await writeFile(path.join(directory, 'runtime.pid'), String(previous.pid))
+  const startup = new SnowLumaStartup(startupConfig({ enabled: true, directory, timeout: 1000 }))
+  t.after(async () => { await startup.close(); previous.kill('SIGKILL'); await closeServer(server); await rm(directory, { recursive: true, force: true }) })
+  await startup.open({ mode: 'forward', url: endpoint, token: 'test-token' }, new AbortController().signal)
+  await previousExit
+  assert.equal(startup.status().managed, true)
+  assert.equal(startup.status().state, 'running')
 })
