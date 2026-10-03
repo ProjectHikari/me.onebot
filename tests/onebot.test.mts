@@ -9,6 +9,7 @@ import { listen, until, closeServer } from './fixtures.mts'
 test('OneBot segment and CQ messages preserve mentions and ignore self messages', () => {
   const message = bodyMessage({ post_type: 'message', self_id: 10, user_id: 20, message_id: 1, message_type: 'group', group_id: 30, message: '[CQ:at,qq=10]你好&#91;CQ:test&#93;' })!
   assert.equal(message.mentioned, true); assert.equal(message.text, '你好[CQ:test]'); assert.equal(message.groupId, '30')
+  assert.deepEqual(message.mentionIds, ['10'])
   assert.equal(bodyMessage({ post_type: 'message', self_id: 10, user_id: 10, message_type: 'private' }), null)
 })
 test('forward WS authenticates, matches echo, deduplicates and releases timeout slots', async t => {

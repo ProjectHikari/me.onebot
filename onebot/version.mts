@@ -1,1 +1,1 @@
-export const VERSION = 'b1-Rc8'
+export const VERSION = 'b1Rc9'

@@ -7,7 +7,7 @@ import { startupConfig, type StartupConfig } from './start.mts'
 import { integer, log, object, text, Work } from '../shared/runtime.mts'
 
 export type OneBotConfig = { mode: 'forward' | 'reverse'; url: string; host: string; port: number; path: string; token: string; timeout: number; startup: StartupConfig }
-export type BodyMessage = { selfId: string; userId: string; groupId?: string; messageId: string; text: string; mentioned: boolean; segments: any[]; time: number }
+export type BodyMessage = { selfId: string; userId: string; groupId?: string; messageId: string; replyId?: string; forwardIds: string[]; senderName: string; text: string; mentioned: boolean; mentionIds: string[]; segments: any[]; reactions: any[]; time: number }
 type Pending = { socket: WebSocket; resolve: (value: any) => void; reject: (error: Error) => void; release: () => void }
 
 export function validateConfig(raw: any): OneBotConfig {
@@ -29,13 +29,26 @@ export function bodyMessage(raw: any): BodyMessage | null {
   if (value.post_type !== 'message' || !['private', 'group'].includes(value.message_type) || String(value.user_id) === String(value.self_id)) return null
   if (!value.self_id || !value.user_id || value.message_id === undefined) throw new Error('OneBot消息缺少身份字段')
   const segments = Array.isArray(value.message) ? value.message : typeof value.message === 'string' ? cqSegments(value.message) : []
-  let content = '', mentioned = false
+  let content = '', mentioned = value.to_me === true || value.is_at_me === true, replyId = '', senderName = ''
+  const forwardIds: string[] = [], mentionIds: string[] = []
   for (const segment of segments) {
     if (segment.type === 'text') content += typeof segment.data?.text === 'string' ? segment.data.text : ''
-    if (segment.type === 'at' && String(segment.data?.qq) === String(value.self_id)) mentioned = true
+    if (segment.type === 'at') {
+      const target = String(segment.data?.qq ?? '')
+      if (target !== 'all' && target) mentionIds.push(target)
+      if (target === String(value.self_id)) mentioned = true
+    }
+    if (segment.type === 'reply' && segment.data?.id !== undefined) replyId = String(segment.data.id)
+    if (segment.type === 'forward' && segment.data?.id !== undefined) forwardIds.push(String(segment.data.id))
+    if (segment.type === 'face') content += `[表情:${String(segment.data?.id ?? segment.data?.text ?? 'QQ表情')}]`
+    if (segment.type === 'image') content += '[图片]'
+    if (segment.type === 'record') content += '[语音]'
+    if (segment.type === 'forward') content += '[聊天记录]'
   }
+  const sender = object(value.sender ?? {})
+  senderName = String(sender.card || sender.nickname || value.sender_name || value.user_id).slice(0, 128)
   return { selfId: String(value.self_id), userId: String(value.user_id), groupId: value.message_type === 'group' ? text(String(value.group_id), '群ID', 32) : undefined,
-    messageId: String(value.message_id), text: content.slice(0, 32768), mentioned, segments, time: Number(value.time) || Math.floor(Date.now() / 1000) }
+    messageId: String(value.message_id), replyId: replyId || undefined, forwardIds: forwardIds.slice(0, 8), senderName, text: content.slice(0, 32768), mentioned, mentionIds: [...new Set(mentionIds)].slice(0, 32), segments, reactions: [], time: Number(value.time) || Math.floor(Date.now() / 1000) }
 }
 function cqSegments(content: string): any[] {
   const decode = (value: string) => value.replace(/&#91;/g, '[').replace(/&#93;/g, ']').replace(/&#44;/g, ',').replace(/&amp;/g, '&')
@@ -66,6 +79,7 @@ export class OneBot {
   sent = 0
   reconnects = 0
   lastError = ''
+  reactions = new Map<string, { groupId: string; messageId: string; emojiId: string; count: number; userIds: string[]; updated: number }>()
   onMessage: (message: BodyMessage, signal: AbortSignal) => Promise<void>
   constructor(config: OneBotConfig, onMessage: OneBot['onMessage'], signal?: AbortSignal) { this.config = config; this.onMessage = onMessage; this.work = new Work(signal) }
   async open(): Promise<void> {
@@ -140,8 +154,10 @@ export class OneBot {
           if (selfId && String(value.self_id) !== selfId) throw new Error('OneBot上报身份与连接不一致')
           if (!selfId && role !== 'event') { selfId = String(value.self_id); this.api.set(selfId, socket) }
         }
+        if (value.post_type === 'notice' && value.notice_type === 'group_msg_emoji_like') { this.recordReaction(value); return }
         const message = bodyMessage(value)
         if (!message) return
+        if (message.groupId) message.reactions = this.messageReactions(message.groupId, message.replyId ?? message.messageId)
         const key = `${message.selfId}:${message.groupId ?? message.userId}:${message.messageId}`, now = Date.now()
         for (const [key, time] of this.seen) if (now - time > 120000) this.seen.delete(key)
         if (this.seen.has(key)) return
@@ -151,6 +167,26 @@ export class OneBot {
         this.work.run(signal => this.onMessage(message, signal)).catch(error => { if (!this.work.signal.aborted) log('WARN', 'me.onebot', `消息处理失败: ${String(error)}`) })
       } catch (error) { this.lastError = String(error); log('WARN', 'me.onebot', '收到无效的OneBot数据') }
     })
+  }
+  private recordReaction(value: any): void {
+    const groupId = String(value.group_id ?? ''), messageId = String(value.message_id ?? ''), userId = String(value.operator_id ?? value.user_id ?? '')
+    if (!/^\d{1,16}$/.test(groupId) || !messageId) return
+    const now = Date.now()
+    for (const [key, item] of this.reactions) if (now - item.updated > 600000) this.reactions.delete(key)
+    for (const like of Array.isArray(value.likes) ? value.likes.slice(0, 16) : []) {
+      const emojiId = String(like.emoji_id ?? '')
+      if (!emojiId || emojiId.length > 128) continue
+      const key = `${groupId}:${messageId}:${emojiId}`, current = this.reactions.get(key)
+      if (value.sub_type === 'remove') {
+        if (current) { current.count = Math.max(0, Number(like.count) || current.count - 1); current.userIds = current.userIds.filter(id => id !== userId); current.updated = now; if (!current.count) this.reactions.delete(key) }
+      } else {
+        this.reactions.set(key, { groupId, messageId, emojiId, count: Math.max(1, Number(like.count) || (current?.count ?? 0) + 1), userIds: [...new Set([...(current?.userIds ?? []), userId])].slice(-16), updated: now })
+      }
+    }
+    while (this.reactions.size > 2048) this.reactions.delete(this.reactions.keys().next().value!)
+  }
+  private messageReactions(groupId: string, messageId: string): any[] {
+    return [...this.reactions.values()].filter(item => item.groupId === groupId && item.messageId === messageId).map(({ emojiId, count, userIds }) => ({ emojiId, count, userIds }))
   }
   pulse(): void {
     if (!this.enabled || this.stopping) return
@@ -188,8 +224,12 @@ export class OneBot {
       const target = input.groupId ?? input.userId
       if (!/^[0-9]{1,16}$/.test(String(target)) || !Number.isSafeInteger(Number(target)) || Number(target) <= 0) throw new Error('发送目标无效')
       const content = text(input.text, '回复文本', 32768)
+      const message: any[] = []
+      if (input.replyId && input.groupId) message.push({ type: 'reply', data: { id: String(input.replyId) } })
+      if (input.atUserId && input.groupId) message.push({ type: 'at', data: { qq: String(input.atUserId) } }, { type: 'text', data: { text: ' ' } })
+      message.push({ type: 'text', data: { text: content } })
       const result = await this.action({ selfId: input.selfId, action: input.groupId ? 'send_group_msg' : 'send_private_msg',
-        params: { [input.groupId ? 'group_id' : 'user_id']: Number(target), message: [{ type: 'text', data: { text: content } }] } }, AbortSignal.any([signal, this.work.signal]))
+        params: { [input.groupId ? 'group_id' : 'user_id']: Number(target), message } }, AbortSignal.any([signal, this.work.signal]))
       this.sent++; return result
     }
     throw new Error(`未知OneBot方法${method}`)
