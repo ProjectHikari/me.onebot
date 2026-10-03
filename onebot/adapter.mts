@@ -2,9 +2,11 @@ import { createServer, type Server } from 'node:http'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { WebSocket, WebSocketServer } from 'ws'
-import { integer, log, object, text, VERSION, Work } from '../shared/runtime.mts'
+import { VERSION } from './version.mts'
+import { startupConfig, type StartupConfig } from './start.mts'
+import { integer, log, object, text, Work } from '../shared/runtime.mts'
 
-export type OneBotConfig = { mode: 'forward' | 'reverse'; url: string; host: string; port: number; path: string; token: string; timeout: number }
+export type OneBotConfig = { mode: 'forward' | 'reverse'; url: string; host: string; port: number; path: string; token: string; timeout: number; startup: StartupConfig }
 export type BodyMessage = { selfId: string; userId: string; groupId?: string; messageId: string; text: string; mentioned: boolean; segments: any[]; time: number }
 type Pending = { socket: WebSocket; resolve: (value: any) => void; reject: (error: Error) => void; release: () => void }
 
@@ -15,11 +17,12 @@ export function validateConfig(raw: any): OneBotConfig {
   const parsed = new URL(url)
   if (!['ws:', 'wss:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error('WebSocket地址无效')
   const host = text(input.host ?? '127.0.0.1', '监听地址', 256), token = typeof input.token === 'string' ? input.token : ''
+  if (input.token !== undefined && typeof input.token !== 'string') throw new Error('OneBot令牌格式错误')
   if (/[\r\n]/.test(token) || token.length > 4096) throw new Error('OneBot令牌格式错误')
   if (mode === 'reverse' && !['127.0.0.1', '::1', 'localhost'].includes(host) && !token) throw new Error('远程反向WebSocket需要设置令牌')
   const route = input.path ?? '/onebot'
   if (typeof route !== 'string' || !/^\/[a-zA-Z0-9/_-]*$/.test(route)) throw new Error('反向WebSocket路径无效')
-  return { mode, url, host, port: integer(input.port ?? 6701, '端口', 0, 65535), path: route, token, timeout: integer(input.timeout ?? 15000, '调用超时', 100, 25000) }
+  return { mode, url, host, port: integer(input.port ?? 6701, '端口', 0, 65535), path: route, token, timeout: integer(input.timeout ?? 15000, '调用超时', 100, 25000), startup: startupConfig(input.startup) }
 }
 export function bodyMessage(raw: any): BodyMessage | null {
   const value = object(raw)
@@ -179,7 +182,7 @@ export class OneBot {
     const input = raw ?? {}
     if (method === 'status') return { version: VERSION, mode: this.config.mode, connected: [...new Set(this.api.values())].filter(socket => socket.readyState === WebSocket.OPEN).length,
       bots: [...this.api.keys()].filter(Boolean), received: this.received, sent: this.sent, pending: this.pending.size, reconnects: this.reconnects, error: this.lastError,
-      address: this.config.mode === 'reverse' ? `ws://${this.config.host}:${(this.server?.address() as any)?.port ?? this.config.port}${this.config.path}` : this.config.url.replace(/\?.*$/, '') }
+      address: this.config.mode === 'reverse' ? `ws://${this.config.host.includes(':') ? `[${this.config.host}]` : this.config.host}:${(this.server?.address() as any)?.port ?? this.config.port}${this.config.path}` : this.config.url.replace(/\?.*$/, '') }
     if (method === 'action') return this.action(input, AbortSignal.any([signal, this.work.signal]))
     if (method === 'send') {
       const target = input.groupId ?? input.userId
