@@ -140,3 +140,25 @@ test('startup does not block initialization while QQ is unavailable and releases
   assert.equal(manager.startup!.work.active.size, 0)
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' })
 })
+
+test('adapter emits private authentication input once and keeps it out of normal chat', async t => {
+  const chat: string[] = [], auth: string[] = []
+  const adapter = new OneBot(validateConfig({ mode: 'reverse', port: 0, verificationIngress: true }),
+    async message => { chat.push(message.text) }, undefined, async event => { auth.push(event.text ?? event.kind) })
+  t.after(() => adapter.close())
+  await adapter.open()
+  adapter.activate()
+  const url = (await adapter.service('status', {}, new AbortController().signal)).address
+  const socket = new WebSocket(url, { headers: { 'X-Self-ID': '10' } })
+  await new Promise<void>((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject) })
+  const code = 'OMO-' + 'A'.repeat(22)
+  const privateMessage = { post_type: 'message', message_type: 'private', group_id: 30, self_id: 10, user_id: 20 }
+  const proof = { ...privateMessage, message_id: 1, message: '验证码：' + code }
+  socket.send(JSON.stringify(proof))
+  socket.send(JSON.stringify(proof))
+  socket.send(JSON.stringify({ ...privateMessage, message_id: 2, message: '普通私信' }))
+  socket.send(JSON.stringify({ ...privateMessage, post_type: 'notice', notice_type: 'group_increase' }))
+  await until(() => chat.length + auth.length, count => count >= 3)
+  assert.deepEqual(auth, [code, 'join'])
+  assert.deepEqual(chat, ['普通私信'])
+})

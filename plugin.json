@@ -8,7 +8,8 @@
     "adapter.onebot"
   ],
   "events": {
-    "body.onebot.message": "parallel"
+    "body.onebot.message": "parallel",
+    "body.onebot.verification": "parallel"
   },
   "dir": "onebot"
 }

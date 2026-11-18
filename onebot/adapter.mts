@@ -6,8 +6,30 @@ import { VERSION } from './version.mts'
 import { startupConfig, type StartupConfig } from './start.mts'
 import { integer, log, object, text, Work } from '../shared/runtime.mts'
 
-export type OneBotConfig = { mode: 'forward' | 'reverse'; url: string; host: string; port: number; path: string; token: string; timeout: number; startup: StartupConfig }
+export type OneBotConfig = { mode: 'forward' | 'reverse'; url: string; host: string; port: number; path: string; token: string; timeout: number; startup: StartupConfig; verificationIngress: boolean }
 export type BodyMessage = { selfId: string; userId: string; groupId?: string; messageId: string; replyId?: string; forwardIds: string[]; senderName: string; text: string; mentioned: boolean; mentionIds: string[]; segments: any[]; reactions: any[]; time: number }
+export type VerificationEvent = { kind: 'join' | 'leave' | 'private'; selfId: string; userId: string; groupId?: string; time: number; text?: string }
+export type VerificationIngress = (event: VerificationEvent, signal: AbortSignal) => Promise<void>
+const qqID = /^[1-9][0-9]{0,14}$/
+
+export function verificationInput(value: any, message?: BodyMessage): VerificationEvent | undefined {
+  if (!value || typeof value !== 'object') return
+  const selfId = String(value.self_id ?? ''), userId = String(value.user_id ?? ''), groupId = String(value.group_id ?? value.temp_source_group_id ?? '')
+  if (!qqID.test(selfId) || !qqID.test(userId) || selfId === userId) return
+  const time = Number(value.time) || Math.floor(Date.now() / 1000)
+  if (value.post_type === 'notice' && qqID.test(groupId)) {
+    if (value.notice_type === 'group_increase') return { kind: 'join', selfId, userId, groupId, time }
+    if (value.notice_type === 'group_decrease' && ['leave', 'kick'].includes(value.sub_type)) return { kind: 'leave', selfId, userId, groupId, time }
+  }
+  if (value.message_type !== 'private' || !message) return
+  const input = message.text.trim()
+  const matches = [...input.matchAll(/(?<![A-Za-z0-9_-])OMO-[A-Za-z0-9_-]{22}(?![A-Za-z0-9_-])/g)]
+  const verifiedText = matches.length === 1 ? matches[0][0] : undefined
+  const command = /^(?:开始|\/restart oauth)(?: [1-9][0-9]{0,14})?$/.test(input) ? input : undefined
+  if (!command && !matches.length) return
+  return { kind: 'private', selfId, userId, groupId: qqID.test(groupId) ? groupId : undefined, time, text: command ?? verifiedText }
+}
+
 type Pending = { socket: WebSocket; resolve: (value: any) => void; reject: (error: Error) => void; release: () => void }
 
 export function validateConfig(raw: any): OneBotConfig {
@@ -22,7 +44,9 @@ export function validateConfig(raw: any): OneBotConfig {
   if (mode === 'reverse' && !['127.0.0.1', '::1', 'localhost'].includes(host) && !token) throw new Error('远程反向WebSocket需要设置令牌')
   const route = input.path ?? '/onebot'
   if (typeof route !== 'string' || !/^\/[a-zA-Z0-9/_-]*$/.test(route)) throw new Error('反向WebSocket路径无效')
-  return { mode, url, host, port: integer(input.port ?? 6701, '端口', 0, 65535), path: route, token, timeout: integer(input.timeout ?? 15000, '调用超时', 100, 25000), startup: startupConfig(input.startup) }
+  const verificationIngress = input.verificationIngress ?? false
+  if (typeof verificationIngress !== 'boolean') throw new Error('认证入口配置需要是布尔值')
+  return { mode, url, host, verificationIngress, port: integer(input.port ?? 6701, '端口', 0, 65535), path: route, token, timeout: integer(input.timeout ?? 15000, '调用超时', 100, 25000), startup: startupConfig(input.startup) }
 }
 export function bodyMessage(raw: any): BodyMessage | null {
   const value = object(raw)
@@ -81,7 +105,13 @@ export class OneBot {
   lastError = ''
   reactions = new Map<string, { groupId: string; messageId: string; emojiId: string; count: number; userIds: string[]; updated: number }>()
   onMessage: (message: BodyMessage, signal: AbortSignal) => Promise<void>
-  constructor(config: OneBotConfig, onMessage: OneBot['onMessage'], signal?: AbortSignal) { this.config = config; this.onMessage = onMessage; this.work = new Work(signal) }
+  readonly onVerification?: VerificationIngress
+  constructor(config: OneBotConfig, onMessage: OneBot['onMessage'], signal?: AbortSignal, onVerification?: VerificationIngress) {
+    this.config = config
+    this.onMessage = onMessage
+    this.onVerification = onVerification
+    this.work = new Work(signal)
+  }
   async open(): Promise<void> {
     if (this.config.mode !== 'reverse') return
     this.server = createServer((_req, res) => { res.writeHead(404); res.end() })
@@ -156,17 +186,32 @@ export class OneBot {
         }
         if (value.post_type === 'notice' && value.notice_type === 'group_msg_emoji_like') { this.recordReaction(value); return }
         const message = bodyMessage(value)
+        const verification = this.config.verificationIngress && this.onVerification ? verificationInput(value, message ?? undefined) : undefined
+        if (verification) {
+          if (message && this.duplicate(message)) return
+          if (this.work.active.size >= 64) { log('WARN', 'me.onebot', '认证事件处理已满'); return }
+          this.work.run(signal => this.onVerification!(verification, signal)).catch(() => {
+            if (!this.work.signal.aborted) log('WARN', 'me.onebot', '认证事件处理失败')
+          })
+          return
+        }
         if (!message) return
         if (message.groupId) message.reactions = this.messageReactions(message.groupId, message.replyId ?? message.messageId)
-        const key = `${message.selfId}:${message.groupId ?? message.userId}:${message.messageId}`, now = Date.now()
-        for (const [key, time] of this.seen) if (now - time > 120000) this.seen.delete(key)
-        if (this.seen.has(key)) return
-        if (this.seen.size >= 10000) this.seen.delete(this.seen.keys().next().value!)
-        this.seen.set(key, now); this.received++
+        if (this.duplicate(message)) return
+        this.received++
         if (this.work.active.size >= 64) { log('WARN', 'me.onebot', '消息处理已满，本条消息未接入'); return }
         this.work.run(signal => this.onMessage(message, signal)).catch(error => { if (!this.work.signal.aborted) log('WARN', 'me.onebot', `消息处理失败: ${String(error)}`) })
       } catch (error) { this.lastError = String(error); log('WARN', 'me.onebot', '收到无效的OneBot数据') }
     })
+  }
+  private duplicate(message: BodyMessage): boolean {
+    const key = `${message.selfId}:${message.groupId ?? message.userId}:${message.messageId}`
+    const now = Date.now()
+    for (const [oldKey, time] of this.seen) if (now - time > 120000) this.seen.delete(oldKey)
+    if (this.seen.has(key)) return true
+    if (this.seen.size >= 10000) this.seen.delete(this.seen.keys().next().value!)
+    this.seen.set(key, now)
+    return false
   }
   private recordReaction(value: any): void {
     const groupId = String(value.group_id ?? ''), messageId = String(value.message_id ?? ''), userId = String(value.operator_id ?? value.user_id ?? '')
@@ -216,7 +261,7 @@ export class OneBot {
   async service(method: string, raw: any, signal: AbortSignal): Promise<any> {
     this.work.signal.throwIfAborted()
     const input = raw ?? {}
-    if (method === 'status') return { version: VERSION, mode: this.config.mode, connected: [...new Set(this.api.values())].filter(socket => socket.readyState === WebSocket.OPEN).length,
+    if (method === 'status') return { version: VERSION, mode: this.config.mode, verificationIngress: this.config.verificationIngress, connected: [...new Set(this.api.values())].filter(socket => socket.readyState === WebSocket.OPEN).length,
       bots: [...this.api.keys()].filter(Boolean), received: this.received, sent: this.sent, pending: this.pending.size, reconnects: this.reconnects, error: this.lastError,
       address: this.config.mode === 'reverse' ? `ws://${this.config.host.includes(':') ? `[${this.config.host}]` : this.config.host}:${(this.server?.address() as any)?.port ?? this.config.port}${this.config.path}` : this.config.url.replace(/\?.*$/, '') }
     if (method === 'action') return this.action(input, AbortSignal.any([signal, this.work.signal]))

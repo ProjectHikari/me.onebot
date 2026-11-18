@@ -4,7 +4,8 @@ import { dataRoot, log } from '../shared/runtime.mts'
 import { OneBotManager } from './manager.mts'
 
 await run(async ctx => {
-  const adapter = new OneBotManager(process.env.ME_ONEBOT_CONFIG ?? path.join(dataRoot, 'onebot.json'), (message, signal) => ctx.parallel('body.onebot.message', message as any, signal), ctx.signal)
+  const adapter = new OneBotManager(process.env.ME_ONEBOT_CONFIG ?? path.join(dataRoot, 'onebot.json'), (message, signal) => ctx.parallel('body.onebot.message', message as any, signal), ctx.signal,
+    (event, signal) => ctx.parallel('body.onebot.verification', event, signal))
   await ctx.defer('OneBot连接与消息调用', () => adapter.close())
   await adapter.open()
   log('INFO', ctx.pluginId, `OneBot连接方式: ${adapter.adapter!.config.mode === 'forward' ? '正向' : '反向'}WebSocket`)

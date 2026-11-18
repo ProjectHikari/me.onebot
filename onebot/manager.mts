@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { log, object, Work, writeJSON } from '../shared/runtime.mts'
 import { SnowLumaStartup } from './start.mts'
-import { OneBot, validateConfig, type OneBotConfig } from './adapter.mts'
+import { OneBot, validateConfig, type OneBotConfig, type VerificationIngress } from './adapter.mts'
 
 function publicURL(raw: string): string { const url = new URL(raw); for (const key of url.searchParams.keys()) if (/token|key|secret|password|authorization/i.test(key)) url.searchParams.set(key, '[已隐藏]'); return url.href }
 const digest = (value: string) => createHash('sha256').update(value).digest('hex')
@@ -19,11 +19,12 @@ export class OneBotManager {
   mutations = Promise.resolve()
   enabled = false
   updating = false
-  constructor(file: string, onMessage: OneBot['onMessage'], signal?: AbortSignal) {
-    this.file = file; this.onMessage = onMessage; this.work = new Work(signal)
+  readonly onVerification?: VerificationIngress
+  constructor(file: string, onMessage: OneBot['onMessage'], signal?: AbortSignal, onVerification?: VerificationIngress) {
+    this.file = file; this.onMessage = onMessage; this.onVerification = onVerification; this.work = new Work(signal)
   }
   onMessage: OneBot['onMessage']
-  create(config: OneBotConfig): OneBot { const value = new OneBot(config, this.onMessage, this.work.signal); this.retired.add(value); return value }
+  create(config: OneBotConfig): OneBot { const value = new OneBot(config, this.onMessage, this.work.signal, this.onVerification); this.retired.add(value); return value }
   async open(): Promise<void> {
     const saved = await contents(this.file)
     this.revision = digest(saved); this.adapter = this.create(validateConfig(saved ? JSON.parse(saved) : {}))
