@@ -2,5 +2,5 @@
   "id": "me.onebot",
   "command": ["${NODE}", "plugin.mts"],
   "provides": ["adapter.onebot"],
-  "events": { "body.onebot.message": "parallel", "body.onebot.verification": "parallel" }
+  "events": { "body.onebot.message": "parallel", "body.onebot.verification": "parallel", "body.onebot.commands": "parallel" }
 }

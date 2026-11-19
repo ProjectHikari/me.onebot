@@ -9,7 +9,8 @@
   ],
   "events": {
     "body.onebot.message": "parallel",
-    "body.onebot.verification": "parallel"
+    "body.onebot.verification": "parallel",
+    "body.onebot.commands": "parallel"
   },
   "dir": "onebot"
 }
